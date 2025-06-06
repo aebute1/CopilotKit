@@ -35,11 +35,11 @@ import {
   convertSystemMessageToAssistantAPI,
 } from "./utils";
 import { RunSubmitToolOutputsStreamParams } from "openai/resources/beta/threads/runs/runs";
-import { AssistantStream } from "openai/lib/AssistantStream";
 import { RuntimeEventSource } from "../events";
 import { ActionInput } from "../../graphql/inputs/action.input";
 import { AssistantStreamEvent, AssistantTool } from "openai/resources/beta/assistants";
 import { ForwardedParametersInput } from "../../graphql/inputs/forwarded-parameters.input";
+import {Stream} from "openai/streaming";
 
 export interface OpenAIAssistantAdapterParams {
   /**
@@ -93,8 +93,10 @@ export class OpenAIAssistantAdapter implements CopilotServiceAdapter {
 
   constructor(params: OpenAIAssistantAdapterParams) {
     this.openai = params.openai || new OpenAI({});
-    this.codeInterpreterEnabled = params.codeInterpreterEnabled !== undefined ? params.codeInterpreterEnabled : true;
-    this.fileSearchEnabled = params.fileSearchEnabled !== undefined ? params.fileSearchEnabled : true;
+    this.codeInterpreterEnabled =
+      params.codeInterpreterEnabled !== undefined ? params.codeInterpreterEnabled : true;
+    this.fileSearchEnabled =
+      params.fileSearchEnabled !== undefined ? params.fileSearchEnabled : true;
     this.assistantId = params.assistantId;
     this.disableParallelToolCalls = params?.disableParallelToolCalls || false;
     this.keepSystemRole = params?.keepSystemRole ?? false;
@@ -184,8 +186,9 @@ export class OpenAIAssistantAdapter implements CopilotServiceAdapter {
       },
     );
 
-    const stream = this.openai.beta.threads.runs.submitToolOutputsStream(threadId, runId, {
+    const stream = await this.openai.beta.threads.runs.submitToolOutputs(threadId, runId, {
       tool_outputs: toolOutputs,
+      stream: true,
       ...(this.disableParallelToolCalls && { parallel_tool_calls: false }),
     });
 
@@ -228,9 +231,9 @@ export class OpenAIAssistantAdapter implements CopilotServiceAdapter {
       ...(this.codeInterpreterEnabled ? [{ type: "code_interpreter" } as AssistantTool] : []),
       ...(this.fileSearchEnabled ? [{ type: "file_search" } as AssistantTool] : []),
     ];
-
-    let stream = this.openai.beta.threads.runs.stream(threadId, {
+    let stream = await this.openai.beta.threads.runs.create(threadId, {
       assistant_id: this.assistantId,
+      stream: true,
       instructions,
       ...(tools.length > 0 && { tools }),
       ...(forwardedParameters?.maxTokens && {
@@ -239,12 +242,19 @@ export class OpenAIAssistantAdapter implements CopilotServiceAdapter {
       ...(this.disableParallelToolCalls && { parallel_tool_calls: false }),
     });
 
-    await this.streamResponse(stream, eventSource);
+    const [stream1, stream2] = stream.tee();
 
-    return getRunIdFromStream(stream);
+    await this.streamResponse(stream1, eventSource);
+
+    return getRunIdFromStream(stream2);
   }
 
-  private async streamResponse(stream: AssistantStream, eventSource: RuntimeEventSource) {
+  private async streamResponse(
+    stream: Stream<AssistantStreamEvent> & {
+      _request_id?: string | null;
+    },
+    eventSource: RuntimeEventSource,
+  ) {
     eventSource.stream(async (eventStream$) => {
       let inFunctionCall = false;
       let currentMessageId: string;
@@ -311,15 +321,13 @@ export class OpenAIAssistantAdapter implements CopilotServiceAdapter {
   }
 }
 
-function getRunIdFromStream(stream: AssistantStream): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    let runIdGetter = (event: AssistantStreamEvent) => {
-      if (event.event === "thread.run.created") {
-        const runId = event.data.id;
-        stream.off("event", runIdGetter);
-        resolve(runId);
-      }
-    };
-    stream.on("event", runIdGetter);
-  });
+async function getRunIdFromStream(
+    stream: Stream<AssistantStreamEvent> & { _request_id?: string | null },
+  ): Promise<string> {
+
+  for await (const event of stream) {
+    if (event.event === "thread.run.created") {
+      return event.data.id;
+    }
+  }
 }
